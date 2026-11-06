@@ -430,7 +430,13 @@ jobs:
             exit 1
           fi
  
-          python "$CHAIN_SCRIPT" --update-lock
+          # Newer checkouts moved --update-lock into tool_lock.py
+          LOCK_SCRIPT="$(dirname "$CHAIN_SCRIPT")/tool_lock.py"
+          if [[ -f "$LOCK_SCRIPT" ]]; then
+            python "$LOCK_SCRIPT" --update-lock
+          else
+            python "$CHAIN_SCRIPT" --update-lock
+          fi
           python "$CHAIN_SCRIPT" --header
  
       - name: Build unsigned IPA
