@@ -41,6 +41,39 @@ jobs:
           repository: seedds/nxnative
           ref: main
  
+      - name: Add low-address-space fallback to the host (BC fallback only)
+        if: inputs.device == 'iPhone 15 or older (BC fallback)'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # When iOS refuses the profile's guest address-space reservation (iPhone SE 2020 / 3 GB
+          # devices crash with "FATAL reserve guest AS"), retry 256 MB smaller and log errno + the final size.
+          python - <<'PY'
+          p = "dm/host/hle_svc.c"
+          s = open(p, encoding="utf-8").read()
+          old = (
+              "    g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);\n"
+              "    if (g_as == MAP_FAILED) die(\"reserve guest AS\");\n"
+          )
+          new = (
+              "    size_t floor_reserve = 0x10000000 + alias + DM_GAME_MEM_STACK + 0x20000000, want_reserve = g_reserve;\n"
+              "    for (;;) {\n"
+              "        g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);\n"
+              "        if (g_as != MAP_FAILED) break;\n"
+              "        int e = errno;\n"
+              "        LOG(\"reserve guest AS %#zx failed (errno %d)\", g_reserve, e);\n"
+              "        if (g_reserve < floor_reserve + 0x10000000) die(\"reserve guest AS: even %#zx failed (errno %d)\", g_reserve, e);\n"
+              "        g_reserve -= 0x10000000;\n"
+              "    }\n"
+              "    if (g_reserve != want_reserve) LOG(\"guest AS reduced from %#zx to %#zx\", want_reserve, g_reserve);\n"
+          )
+          if s.count(old) != 1:
+              raise SystemExit("hle_svc.c: expected reservation code not found; this checkout differs from the pinned commit")
+          open(p, "w", encoding="utf-8").write(s.replace(old, new))
+          print("patched", p)
+          PY
+          grep -n "guest AS reduced" dm/host/hle_svc.c
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
