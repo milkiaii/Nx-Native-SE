@@ -46,33 +46,50 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # When iOS refuses the profile's guest address-space reservation (iPhone SE 2020 / 3 GB
-          # devices crash with "FATAL reserve guest AS"), retry 256 MB smaller and log errno + the final size.
+          # iPhone SE 2020 / 3 GB devices: iOS refuses the profile's guest address-space reservation (ENOMEM).
+          # 1) retry with smaller reservations (64 MB steps) and log errno + the final size;
+          # 2) when it had to shrink, report an application pool that matches the smaller heap region,
+          #    because games like Balatro size their heap as (pool - used memory) and abort if it is refused.
           python - <<'PY'
           p = "dm/host/hle_svc.c"
           s = open(p, encoding="utf-8").read()
-          old = (
-              "    g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);\n"
-              "    if (g_as == MAP_FAILED) die(\"reserve guest AS\");\n"
-          )
-          new = (
-              "    size_t floor_reserve = 0x10000000 + alias + DM_GAME_MEM_STACK + 0x20000000, want_reserve = g_reserve;\n"
-              "    for (;;) {\n"
-              "        g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);\n"
-              "        if (g_as != MAP_FAILED) break;\n"
-              "        int e = errno;\n"
-              "        LOG(\"reserve guest AS %#zx failed (errno %d)\", g_reserve, e);\n"
-              "        if (g_reserve < floor_reserve + 0x10000000) die(\"reserve guest AS: even %#zx failed (errno %d)\", g_reserve, e);\n"
-              "        g_reserve -= 0x10000000;\n"
-              "    }\n"
-              "    if (g_reserve != want_reserve) LOG(\"guest AS reduced from %#zx to %#zx\", want_reserve, g_reserve);\n"
-          )
-          if s.count(old) != 1:
-              raise SystemExit("hle_svc.c: expected reservation code not found; this checkout differs from the pinned commit")
-          open(p, "w", encoding="utf-8").write(s.replace(old, new))
+
+          def sub(old, new):
+              global s
+              if s.count(old) != 1:
+                  raise SystemExit("hle_svc.c: expected code not found (checkout differs from the pinned commit):\n" + old)
+              s = s.replace(old, new)
+
+          sub(r'''    g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+              if (g_as == MAP_FAILED) die("reserve guest AS");
+          ''', r'''    size_t floor_reserve = 0x10000000 + alias + DM_GAME_MEM_STACK + 0x20000000, want_reserve = g_reserve;
+              for (;;) {
+                  g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+                  if (g_as != MAP_FAILED) break;
+                  int e = errno;
+                  LOG("reserve guest AS %#zx failed (errno %d)", g_reserve, e);
+                  if (g_reserve < floor_reserve + 0x4000000) die("reserve guest AS: even %#zx failed (errno %d)", g_reserve, e);
+                  g_reserve -= 0x4000000;
+              }
+              if (g_reserve != want_reserve) LOG("guest AS reduced from %#zx to %#zx", want_reserve, g_reserve);
+          ''')
+          sub(r'''static void mem_init_once(void) {
+          ''', r'''static uint64_t g_app_pool = DM_GAME_APP_POOL;
+          static size_t big_bss_bytes(void);
+          static void mem_init_once(void) {
+          ''')
+          sub(r'''    g_heap  = g_stack + g_stack_cap; g_heap_cap  = g_reserve - (size_t)(g_heap - g_as);
+          ''', r'''    g_heap  = g_stack + g_stack_cap; g_heap_cap  = g_reserve - (size_t)(g_heap - g_as);
+              if (g_reserve < want_reserve) {
+                  uint64_t fit = (uint64_t)g_heap_cap + (uint64_t)DM_GAME_MEM_USED + big_bss_bytes();
+                  if (fit < g_app_pool) { LOG("application pool reduced from %#llx to %#llx to fit the heap region %#zx", (unsigned long long)g_app_pool, (unsigned long long)fit, g_heap_cap); g_app_pool = fit; }
+              }
+          ''')
+          sub(r'''#define APP_POOL DM_GAME_APP_POOL ''', r'''#define APP_POOL g_app_pool ''')
+          open(p, "w", encoding="utf-8").write(s)
           print("patched", p)
           PY
-          grep -n "guest AS reduced" dm/host/hle_svc.c
+          grep -n "g_app_pool\|guest AS reduced" dm/host/hle_svc.c | cut -c1-160
 
       - name: Set up Python
         uses: actions/setup-python@v5
