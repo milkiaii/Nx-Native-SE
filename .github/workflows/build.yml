@@ -17,6 +17,11 @@ on:
         required: false
         type: string
         default: ""
+      slim:
+        description: "Slim IPA: leave game files out of the IPA (small download). Also uploads RomFS.img to copy to the phone once"
+        required: false
+        type: boolean
+        default: false
  
 permissions:
   contents: read
@@ -878,7 +883,8 @@ jobs:
           python scripts/build_ipa_from_nsp.py \
             "$GAME_DIR" \
             -k "$WORK/prod.keys" \
-            -o "$OUTPUT"
+            -o "$OUTPUT" \
+            ${{ inputs.slim && '--romfs separate' || '' }}
  
           if [[ ! -s "$OUTPUT" ]]; then
             echo "::error::IPA build did not produce an output file."
@@ -897,6 +903,16 @@ jobs:
           if-no-files-found: error
           retention-days: 7
  
+      - name: Upload RomFS image (slim only)
+        if: success() && inputs.slim
+        uses: actions/upload-artifact@v4
+        with:
+          name: RomFS-Image
+          path: ${{ runner.temp }}/GameFiles/*_build/extract/*/RomFS.img
+          if-no-files-found: warn
+          compression-level: 0
+          retention-days: 7
+
       - name: Upload build logs if available
         if: always()
         uses: actions/upload-artifact@v4
