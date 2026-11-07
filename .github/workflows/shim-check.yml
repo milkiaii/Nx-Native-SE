@@ -1,0 +1,29 @@
+name: Shim compile check
+on:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile the Metal 4 stand-ins against the iPhone SDK (no game files needed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re
+          s = open(".github/workflows/build.yml", encoding="utf-8").read()
+          m = re.search(r"SHIM = r'''(.*?)'''\n          patch\(", s, re.S)
+          if not m:
+              raise SystemExit("SHIM block not found in build.yml")
+          body = "\n".join(l[10:] if l.startswith("          ") else l for l in m.group(1).split("\n"))
+          harness = (
+              "#import <Metal/Metal.h>\n#import <QuartzCore/CAMetalLayer.h>\n#include <pthread.h>\n#include <stdio.h>\n"
+              "#define MLOG(...) do { fprintf(stderr, \"[dm] [nvn-mtl] \" __VA_ARGS__); fputc('\\n', stderr); } while (0)\n"
+              "static id<MTLDevice> g_dev; static id<MTLResidencySet> g_res;\n"
+          )
+          open("shim_check.m", "w", encoding="utf-8").write(harness + body + "\nint main(void) { return 0; }\n")
+          print("wrote shim_check.m,", len(body.splitlines()), "lines of shim")
+          PY
+          xcrun --sdk iphoneos clang -fsyntax-only -fobjc-arc -arch arm64 -miphoneos-version-min=17.0 -Wall -Wextra -Wno-unused-parameter shim_check.m 2>&1 | tee check.log
+          ! grep -q "error:" check.log
