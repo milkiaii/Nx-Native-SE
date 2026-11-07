@@ -48,8 +48,10 @@ jobs:
           set -euo pipefail
           # 1) hle_svc.c: when iOS refuses the profile's guest address-space reservation (ENOMEM on 3 GB devices),
           #    retry smaller (64 MB steps) and report an application pool that matches the smaller heap region.
-          # 2) nvn_mtl.m: a GPU without Metal 4 (A13) used to drop every present (black screen);
+          # 2) nvn_mtl.m: a GPU without Metal 4 (A13) used to drop every present (black screen) for OpenGL / Vulkan games;
           #    show the GL window image with a plain classic-Metal render pass instead.
+          # 3) nvn_mtl.m: classic-Metal stand-ins for the Metal 4 queue / command buffers / encoders / argument tables,
+          #    so the NVN layer (most Nintendo games) can start on a GPU without Metal 4. Experimental.
           python - <<'PY'
           import sys
 
@@ -160,6 +162,307 @@ jobs:
               atomic_store(&dm_present_ns, now_ns());
               if (g_classic && !atomic_load(&g_present_discard)) return present_classic(t, ev_val);
               if (g_classic || atomic_load(&g_present_discard)) return 0;'''),
+          ])
+
+          # ---- 3. nvn_mtl.m: classic-Metal stand-ins for Metal 4 so the NVN layer starts on an A13 (iPhone SE 2020 and older) ----
+          SHIM = r'''static int g_shim;   // 1 once the classic-Metal stand-ins for Metal 4 are installed (mtl_init); stays 0 on a Mac or a GPU with Metal 4
+          #if TARGET_OS_IOS && !TARGET_OS_SIMULATOR
+          #import <objc/runtime.h>
+          // ===================================================================================================================================================================
+          // Classic-Metal stand-ins for the Metal 4 objects, for a GPU without Metal 4 (A13 / iPhone SE 2020 and older). The NVN layer talks to MTL4 queues, command buffers, encoders and
+          // argument tables; mtl_init wraps the device in NxDevice, which hands out these classes instead. They record nothing: each call is run at once on a classic MTLCommandQueue.
+          //  - argument tables hold GPU addresses and resource IDs; a draw / dispatch binds the ones that changed with setBuffer / setTexture (the address is looked up among the residency set's buffers)
+          //  - the residency sets are plain sets; every encoder marks all of their resources resident (useResources), because shaders reach textures and storage buffers through IDs / addresses read from buffers
+          //  - barriers are left to classic Metal's own hazard tracking (the layer creates no untracked resources, apart from the optional image heap)
+          // ===================================================================================================================================================================
+          static id<MTLCommandQueue> g_shim_q;
+          static pthread_mutex_t g_shim_mu = PTHREAD_MUTEX_INITIALIZER;
+          static uint64_t g_shim_gen;
+          typedef struct { uint64_t lo, hi; __unsafe_unretained id<MTLBuffer> buf; } shim_range;
+          static shim_range *g_shim_rg; static size_t g_shim_rn, g_shim_rcap;
+          static NSMutableSet *g_shim_set, *g_shim_heaps;
+          static NSArray *g_shim_snap; static int g_shim_dirty = 1;
+          static NSMapTable *g_shim_rid;   // MTLResourceID._impl -> texture / sampler (weak)
+          static const char kShimFb;
+
+          static size_t shim_lower(uint64_t a) { size_t lo = 0, hi = g_shim_rn; while (lo < hi) { size_t m = (lo + hi) / 2; if (g_shim_rg[m].lo <= a) lo = m + 1; else hi = m; } return lo; }   // first range with lo > a
+          static void shim_add(id a) {
+              if (!a) return;
+              pthread_mutex_lock(&g_shim_mu);
+              if (!g_shim_set) { g_shim_set = [NSMutableSet set]; g_shim_heaps = [NSMutableSet set]; }
+              if ([a conformsToProtocol:@protocol(MTLHeap)]) { [g_shim_heaps addObject:a]; }
+              else if (![g_shim_set containsObject:a]) {
+                  [g_shim_set addObject:a]; g_shim_dirty = 1;
+                  if ([a conformsToProtocol:@protocol(MTLBuffer)]) {
+                      id<MTLBuffer> b = a; uint64_t lo = b.gpuAddress, len = b.length;
+                      if (len) {
+                          if (g_shim_rn == g_shim_rcap) { g_shim_rcap = g_shim_rcap ? g_shim_rcap * 2 : 1024; g_shim_rg = realloc(g_shim_rg, g_shim_rcap * sizeof *g_shim_rg); }
+                          size_t i = shim_lower(lo); memmove(&g_shim_rg[i + 1], &g_shim_rg[i], (g_shim_rn - i) * sizeof *g_shim_rg);
+                          g_shim_rg[i] = (shim_range){lo, lo + len, b}; g_shim_rn++;
+                      }
+                  }
+              }
+              pthread_mutex_unlock(&g_shim_mu);
+          }
+          static void shim_remove(id a) {
+              if (!a) return;
+              pthread_mutex_lock(&g_shim_mu);
+              if ([a conformsToProtocol:@protocol(MTLHeap)]) [g_shim_heaps removeObject:a];
+              else if ([g_shim_set containsObject:a]) {
+                  [g_shim_set removeObject:a]; g_shim_dirty = 1;
+                  if ([a conformsToProtocol:@protocol(MTLBuffer)]) {
+                      for (size_t i = 0; i < g_shim_rn; i++) if (g_shim_rg[i].buf == a) { memmove(&g_shim_rg[i], &g_shim_rg[i + 1], (g_shim_rn - i - 1) * sizeof *g_shim_rg); g_shim_rn--; break; }
+                  }
+              }
+              pthread_mutex_unlock(&g_shim_mu);
+          }
+          static id<MTLBuffer> shim_buf(uint64_t addr, NSUInteger *off) {
+              static int warned;
+              pthread_mutex_lock(&g_shim_mu);
+              size_t i = shim_lower(addr); id<MTLBuffer> b = nil;
+              if (i && addr < g_shim_rg[i - 1].hi) { b = g_shim_rg[i - 1].buf; *off = (NSUInteger)(addr - g_shim_rg[i - 1].lo); }
+              pthread_mutex_unlock(&g_shim_mu);
+              if (!b && warned++ < 8) MLOG("[RED] shim: no buffer holds GPU address %#llx", (unsigned long long)addr);
+              return b;
+          }
+          static id shim_rid_get(uint64_t rid) {
+              static int warned;
+              pthread_mutex_lock(&g_shim_mu); id o = [g_shim_rid objectForKey:@(rid)]; pthread_mutex_unlock(&g_shim_mu);
+              if (!o && warned++ < 8) MLOG("[RED] shim: unknown resource ID %#llx", (unsigned long long)rid);
+              return o;
+          }
+          static void shim_rid_hook(id obj) {   // the texture / sampler classes report their resource ID through gpuResourceID: remember what each ID belongs to
+              static NSMutableSet *done; static dispatch_once_t once; dispatch_once(&once, ^{ done = [NSMutableSet set]; g_shim_rid = [NSMapTable strongToWeakObjectsMapTable]; });
+              Class c = object_getClass(obj);
+              pthread_mutex_lock(&g_shim_mu); BOOL seen = [done containsObject:c]; if (!seen) [done addObject:c]; pthread_mutex_unlock(&g_shim_mu);
+              if (seen) return;
+              SEL s = @selector(gpuResourceID); Method m = class_getInstanceMethod(c, s); if (!m) return;
+              MTLResourceID (*orig)(id, SEL) = (MTLResourceID (*)(id, SEL))method_getImplementation(m);
+              IMP n = imp_implementationWithBlock(^MTLResourceID(id me) {
+                  MTLResourceID r = orig(me, s);
+                  pthread_mutex_lock(&g_shim_mu); [g_shim_rid setObject:me forKey:@(r._impl)]; pthread_mutex_unlock(&g_shim_mu);
+                  return r;
+              });
+              class_replaceMethod(c, s, n, method_getTypeEncoding(m));
+              MLOG("shim: hooked gpuResourceID of %s", class_getName(c));
+          }
+          // Every encoder makes everything in the residency sets resident (classic Metal needs it for resources reached through addresses / IDs held in buffers)
+          static void shim_use(id enc) {
+              pthread_mutex_lock(&g_shim_mu);
+              if (g_shim_dirty || !g_shim_snap) { g_shim_snap = [g_shim_set allObjects]; g_shim_dirty = 0; }
+              NSArray *a = g_shim_snap, *h = g_shim_heaps.count ? [g_shim_heaps allObjects] : nil;
+              pthread_mutex_unlock(&g_shim_mu);
+              NSUInteger n = a.count;
+              if (n) { id __unsafe_unretained *p = malloc(n * sizeof *p); [a getObjects:p range:NSMakeRange(0, n)]; [enc useResources:(const id<MTLResource> __unsafe_unretained *)p count:n usage:MTLResourceUsageRead | MTLResourceUsageWrite]; free(p); }
+              NSUInteger hn = h.count;
+              if (hn) { id __unsafe_unretained *p = malloc(hn * sizeof *p); [h getObjects:p range:NSMakeRange(0, hn)]; [enc useHeaps:(const id<MTLHeap> __unsafe_unretained *)p count:hn]; free(p); }
+          }
+
+          @interface NxBase : NSObject @end
+          @implementation NxBase
+          - (void)doesNotRecognizeSelector:(SEL)s { MLOG("[RED] shim: %s does not implement %s", class_getName(object_getClass(self)), sel_getName(s)); [super doesNotRecognizeSelector:s]; }
+          @end
+
+          @interface NxFeedback : NxBase @property NSError *error; @property CFTimeInterval GPUStartTime, GPUEndTime; @end
+          @implementation NxFeedback @end
+
+          @interface NxResidencySet : NxBase @end
+          @implementation NxResidencySet
+          - (void)addAllocation:(id)a { shim_add(a); }
+          - (void)addAllocations:(const id __unsafe_unretained *)p count:(NSUInteger)n { for (NSUInteger i = 0; i < n; i++) shim_add(p[i]); }
+          - (void)removeAllocation:(id)a { shim_remove(a); }
+          - (void)removeAllocations:(const id __unsafe_unretained *)p count:(NSUInteger)n { for (NSUInteger i = 0; i < n; i++) shim_remove(p[i]); }
+          - (void)removeAllAllocations {}
+          - (void)commit {}
+          - (void)requestResidency {}
+          - (void)endResidency {}
+          - (void)setLabel:(NSString *)l { (void)l; }
+          @end
+
+          @interface NxAllocator : NxBase @end
+          @implementation NxAllocator
+          - (void)reset {}
+          - (void)setLabel:(NSString *)l { (void)l; }
+          - (NSString *)label { return nil; }
+          @end
+
+          @interface NxTable : NxBase { @public uint64_t addr[32], tex[8], smp[8], ga[32], gt[8], gs[8]; } @end
+          @implementation NxTable
+          - (void)setAddress:(uint64_t)a atIndex:(NSUInteger)i { if (i < 32) { addr[i] = a; ga[i] = ++g_shim_gen; } }
+          - (void)setAddress:(uint64_t)a attributeStride:(NSUInteger)s atIndex:(NSUInteger)i { (void)s; [self setAddress:a atIndex:i]; }
+          - (void)setTexture:(MTLResourceID)r atIndex:(NSUInteger)i { if (i < 8) { tex[i] = r._impl; gt[i] = ++g_shim_gen; } }
+          - (void)setSamplerState:(MTLResourceID)r atIndex:(NSUInteger)i { if (i < 8) { smp[i] = r._impl; gs[i] = ++g_shim_gen; } }
+          @end
+
+          typedef struct { uint64_t a[32], t[8], s[8]; } nx_bound;   // what an encoder has bound from one table (the table's generation per slot)
+          static inline void nx_flush_table(NxTable *t, nx_bound *b, int stage, id enc) {   // stage: 0 vertex, 1 fragment, 2 compute
+              if (!t) return;
+              for (int i = 0; i < 32; i++) if (t->addr[i] && t->ga[i] != b->a[i]) {
+                  b->a[i] = t->ga[i]; NSUInteger off = 0; id<MTLBuffer> buf = shim_buf(t->addr[i], &off); if (!buf) continue;
+                  if (stage == 0) [enc setVertexBuffer:buf offset:off atIndex:i]; else if (stage == 1) [enc setFragmentBuffer:buf offset:off atIndex:i]; else [enc setBuffer:buf offset:off atIndex:i];
+              }
+              for (int i = 0; i < 8; i++) {
+                  if (t->tex[i] && t->gt[i] != b->t[i]) { b->t[i] = t->gt[i]; id o = shim_rid_get(t->tex[i]);
+                      if (o) { if (stage == 0) [enc setVertexTexture:o atIndex:i]; else if (stage == 1) [enc setFragmentTexture:o atIndex:i]; else [enc setTexture:o atIndex:i]; } }
+                  if (t->smp[i] && t->gs[i] != b->s[i]) { b->s[i] = t->gs[i]; id o = shim_rid_get(t->smp[i]);
+                      if (o) { if (stage == 0) [enc setVertexSamplerState:o atIndex:i]; else if (stage == 1) [enc setFragmentSamplerState:o atIndex:i]; else [enc setSamplerState:o atIndex:i]; } }
+              }
+          }
+
+          static void nx_copy_prop(id s, id d, NSString *k) { if ([s respondsToSelector:NSSelectorFromString(k)] && [d respondsToSelector:NSSelectorFromString(k)]) { @try { id v = [s valueForKey:k]; if (v) [d setValue:v forKey:k]; } @catch (id e) { (void)e; } } }
+          static MTLRenderPassDescriptor *nx_rpd(MTL4RenderPassDescriptor *s) {
+              MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
+              for (int i = 0; i < 8; i++) { MTLRenderPassColorAttachmentDescriptor *a = s.colorAttachments[i]; if (a.texture) d.colorAttachments[i] = [a copy]; }
+              if (s.depthAttachment.texture) d.depthAttachment = [s.depthAttachment copy];
+              if (s.stencilAttachment.texture) d.stencilAttachment = [s.stencilAttachment copy];
+              for (NSString *k in @[@"renderTargetArrayLength", @"defaultRasterSampleCount", @"renderTargetWidth", @"renderTargetHeight", @"visibilityResultBuffer", @"imageblockSampleLength", @"threadgroupMemoryLength", @"tileWidth", @"tileHeight"]) nx_copy_prop(s, d, k);
+              return d;
+          }
+
+          @interface NxRenderEnc : NxBase { @public id<MTLRenderCommandEncoder> e; NxTable *tv, *tf; nx_bound nbv, nbf; } @end
+          @implementation NxRenderEnc
+          - (id)forwardingTargetForSelector:(SEL)s { return e; }
+          - (BOOL)respondsToSelector:(SEL)s { return [super respondsToSelector:s] || [e respondsToSelector:s]; }
+          - (void)setArgumentTable:(NxTable *)t atStages:(MTLRenderStages)s { if (s & MTLRenderStageVertex) tv = t; if (s & MTLRenderStageFragment) tf = t; }
+          - (void)flush { nx_flush_table(tv, &nbv, 0, e); nx_flush_table(tf, &nbf, 1, e); }
+          - (void)drawPrimitives:(MTLPrimitiveType)p vertexStart:(NSUInteger)v vertexCount:(NSUInteger)n { [self flush]; [e drawPrimitives:p vertexStart:v vertexCount:n]; }
+          - (void)drawPrimitives:(MTLPrimitiveType)p vertexStart:(NSUInteger)v vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i { [self flush]; [e drawPrimitives:p vertexStart:v vertexCount:n instanceCount:i]; }
+          - (void)drawPrimitives:(MTLPrimitiveType)p vertexStart:(NSUInteger)v vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b { [self flush]; [e drawPrimitives:p vertexStart:v vertexCount:n instanceCount:i baseInstance:b]; }
+          - (void)drawPrimitives:(MTLPrimitiveType)p indirectBuffer:(uint64_t)g { [self flush]; NSUInteger o = 0; id<MTLBuffer> b = shim_buf(g, &o); if (b) [e drawPrimitives:p indirectBuffer:b indirectBufferOffset:o]; }
+          - (void)drawIndexedPrimitives:(MTLPrimitiveType)p indexCount:(NSUInteger)n indexType:(MTLIndexType)t indexBuffer:(uint64_t)g indexBufferLength:(NSUInteger)len { (void)len; [self flush]; NSUInteger o = 0; id<MTLBuffer> b = shim_buf(g, &o); if (b) [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:b indexBufferOffset:o]; }
+          - (void)drawIndexedPrimitives:(MTLPrimitiveType)p indexCount:(NSUInteger)n indexType:(MTLIndexType)t indexBuffer:(uint64_t)g indexBufferLength:(NSUInteger)len instanceCount:(NSUInteger)i { (void)len; [self flush]; NSUInteger o = 0; id<MTLBuffer> b = shim_buf(g, &o); if (b) [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:b indexBufferOffset:o instanceCount:i]; }
+          - (void)drawIndexedPrimitives:(MTLPrimitiveType)p indexCount:(NSUInteger)n indexType:(MTLIndexType)t indexBuffer:(uint64_t)g indexBufferLength:(NSUInteger)len instanceCount:(NSUInteger)i baseVertex:(NSInteger)bv baseInstance:(NSUInteger)bi {
+              (void)len; [self flush]; NSUInteger o = 0; id<MTLBuffer> b = shim_buf(g, &o); if (b) [e drawIndexedPrimitives:p indexCount:n indexType:t indexBuffer:b indexBufferOffset:o instanceCount:i baseVertex:bv baseInstance:bi]; }
+          - (void)drawIndexedPrimitives:(MTLPrimitiveType)p indexType:(MTLIndexType)t indexBuffer:(uint64_t)g indexBufferLength:(NSUInteger)len indirectBuffer:(uint64_t)ig {
+              (void)len; [self flush]; NSUInteger o = 0, io = 0; id<MTLBuffer> b = shim_buf(g, &o), ib = shim_buf(ig, &io); if (b && ib) [e drawIndexedPrimitives:p indexType:t indexBuffer:b indexBufferOffset:o indirectBuffer:ib indirectBufferOffset:io]; }
+          - (void)barrierAfterQueueStages:(MTLStages)a beforeStages:(MTLStages)b visibilityOptions:(NSUInteger)v { (void)a; (void)b; (void)v; }
+          - (void)barrierAfterStages:(MTLStages)a beforeQueueStages:(MTLStages)b visibilityOptions:(NSUInteger)v { (void)a; (void)b; (void)v; }
+          - (void)barrierAfterEncoderStages:(MTLStages)a beforeEncoderStages:(MTLStages)b visibilityOptions:(NSUInteger)v { (void)a; (void)b; (void)v;
+              if (@available(iOS 16.0, *)) [e memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures | MTLBarrierScopeRenderTargets afterStages:MTLRenderStageFragment beforeStages:MTLRenderStageVertex]; }
+          - (void)writeTimestampWithGranularity:(NSInteger)g afterStage:(NSUInteger)s intoHeap:(id)h atIndex:(NSUInteger)i { (void)g; (void)s; (void)h; (void)i; }
+          @end
+
+          @interface NxComputeEnc : NxBase { @public id<MTLCommandBuffer> cb; id<MTLComputeCommandEncoder> ce; id<MTLBlitCommandEncoder> be; NxTable *t; nx_bound bc; } @end
+          @implementation NxComputeEnc
+          - (id<MTLComputeCommandEncoder>)comp { if (be) { [be endEncoding]; be = nil; } if (!ce) { ce = [cb computeCommandEncoder]; shim_use(ce); memset(&bc, 0, sizeof bc); } return ce; }
+          - (id<MTLBlitCommandEncoder>)blit { if (ce) { [ce endEncoding]; ce = nil; } if (!be) be = [cb blitCommandEncoder]; return be; }
+          - (id)forwardingTargetForSelector:(SEL)s { return [self comp]; }
+          - (void)setArgumentTable:(NxTable *)tab { t = tab; }
+          - (void)setArgumentTable:(NxTable *)tab atStages:(NSUInteger)s { (void)s; t = tab; }
+          - (void)flush { id<MTLComputeCommandEncoder> c = [self comp]; nx_flush_table(t, &bc, 2, c); }
+          - (void)dispatchThreadgroups:(MTLSize)n threadsPerThreadgroup:(MTLSize)tp { [self flush]; [ce dispatchThreadgroups:n threadsPerThreadgroup:tp]; }
+          - (void)dispatchThreads:(MTLSize)n threadsPerThreadgroup:(MTLSize)tp { [self flush]; [ce dispatchThreads:n threadsPerThreadgroup:tp]; }
+          - (void)dispatchThreadgroupsWithIndirectBuffer:(uint64_t)g threadsPerThreadgroup:(MTLSize)tp { [self flush]; NSUInteger o = 0; id<MTLBuffer> b = shim_buf(g, &o); if (b) [ce dispatchThreadgroupsWithIndirectBuffer:b indirectBufferOffset:o threadsPerThreadgroup:tp]; }
+          - (void)barrierAfterQueueStages:(MTLStages)a beforeStages:(MTLStages)b visibilityOptions:(NSUInteger)v { (void)a; (void)b; (void)v; }
+          - (void)barrierAfterStages:(MTLStages)a beforeQueueStages:(MTLStages)b visibilityOptions:(NSUInteger)v { (void)a; (void)b; (void)v; }
+          - (void)barrierAfterEncoderStages:(MTLStages)a beforeEncoderStages:(MTLStages)b visibilityOptions:(NSUInteger)v { (void)a; (void)b; (void)v; if (ce) [ce memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures]; }
+          - (void)writeTimestampWithGranularity:(NSInteger)g intoHeap:(id)h atIndex:(NSUInteger)i { (void)g; (void)h; (void)i; }
+          - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)doff size:(NSUInteger)n { [[self blit] copyFromBuffer:s sourceOffset:so toBuffer:d destinationOffset:doff size:n]; }
+          - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)r sourceBytesPerImage:(NSUInteger)i sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)sl destinationLevel:(NSUInteger)lv destinationOrigin:(MTLOrigin)o {
+              [[self blit] copyFromBuffer:s sourceOffset:so sourceBytesPerRow:r sourceBytesPerImage:i sourceSize:z toTexture:d destinationSlice:sl destinationLevel:lv destinationOrigin:o]; }
+          - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)r sourceBytesPerImage:(NSUInteger)i sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)sl destinationLevel:(NSUInteger)lv destinationOrigin:(MTLOrigin)o options:(MTLBlitOption)opt {
+              [[self blit] copyFromBuffer:s sourceOffset:so sourceBytesPerRow:r sourceBytesPerImage:i sourceSize:z toTexture:d destinationSlice:sl destinationLevel:lv destinationOrigin:o options:opt]; }
+          - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)doff destinationBytesPerRow:(NSUInteger)r destinationBytesPerImage:(NSUInteger)i {
+              [[self blit] copyFromTexture:s sourceSlice:ss sourceLevel:sl sourceOrigin:so sourceSize:z toBuffer:d destinationOffset:doff destinationBytesPerRow:r destinationBytesPerImage:i]; }
+          - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)doff destinationBytesPerRow:(NSUInteger)r destinationBytesPerImage:(NSUInteger)i options:(MTLBlitOption)opt {
+              [[self blit] copyFromTexture:s sourceSlice:ss sourceLevel:sl sourceOrigin:so sourceSize:z toBuffer:d destinationOffset:doff destinationBytesPerRow:r destinationBytesPerImage:i options:opt]; }
+          - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg {
+              [[self blit] copyFromTexture:s sourceSlice:ss sourceLevel:sl sourceOrigin:so sourceSize:z toTexture:d destinationSlice:ds destinationLevel:dl destinationOrigin:dorg]; }
+          - (void)fillBuffer:(id<MTLBuffer>)b range:(NSRange)r value:(uint8_t)v { [[self blit] fillBuffer:b range:r value:v]; }
+          - (void)generateMipmapsForTexture:(id<MTLTexture>)tx { [[self blit] generateMipmapsForTexture:tx]; }
+          - (void)endEncoding { if (ce) [ce endEncoding]; if (be) [be endEncoding]; ce = nil; be = nil; }
+          @end
+
+          @interface NxCB : NxBase { @public id<MTLCommandBuffer> cb; } @end
+          @implementation NxCB
+          - (void)beginCommandBufferWithAllocator:(id)a { (void)a; cb = [g_shim_q commandBuffer]; }
+          - (void)beginCommandBufferWithAllocator:(id)a options:(id)o { (void)o; [self beginCommandBufferWithAllocator:a]; }
+          - (void)endCommandBuffer {}
+          - (id)renderCommandEncoderWithDescriptor:(MTL4RenderPassDescriptor *)d {
+              NxRenderEnc *r = [NxRenderEnc new]; r->e = [cb renderCommandEncoderWithDescriptor:nx_rpd(d)]; shim_use(r->e); return r; }
+          - (id)renderCommandEncoderWithDescriptor:(MTL4RenderPassDescriptor *)d options:(NSUInteger)o { (void)o; return [self renderCommandEncoderWithDescriptor:d]; }
+          - (id)computeCommandEncoder { NxComputeEnc *c = [NxComputeEnc new]; c->cb = cb; return c; }
+          - (void)useResidencySet:(id)s { (void)s; }
+          - (void)useResidencySets:(const id __unsafe_unretained *)s count:(NSUInteger)n { (void)s; (void)n; }
+          - (void)pushDebugGroup:(NSString *)s { (void)s; }
+          - (void)popDebugGroup {}
+          - (void)setLabel:(NSString *)l { (void)l; }
+          - (NSString *)label { return nil; }
+          - (void)writeTimestampIntoHeap:(id)h atIndex:(NSUInteger)i { (void)h; (void)i; }
+          @end
+
+          @interface NxQueue : NxBase { @public dispatch_queue_t fq; } @end
+          @implementation NxQueue
+          - (void)commit:(const id __unsafe_unretained *)cbs count:(NSUInteger)n options:(id)o {
+              NSArray *hs = o ? objc_getAssociatedObject(o, &kShimFb) : nil;
+              for (NSUInteger i = 0; i < n; i++) {
+                  NxCB *c = cbs[i]; id<MTLCommandBuffer> cb = c->cb; c->cb = nil; if (!cb) continue;
+                  if (hs.count && i + 1 == n) {
+                      dispatch_queue_t q = fq ?: dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+                      [cb addCompletedHandler:^(id<MTLCommandBuffer> b) {
+                          NxFeedback *f = [NxFeedback new]; f.error = b.error; f.GPUStartTime = b.GPUStartTime; f.GPUEndTime = b.GPUEndTime;
+                          for (id h in hs) { void (^blk)(id) = h; dispatch_async(q, ^{ blk(f); }); }
+                      }];
+                  }
+                  [cb commit];
+              }
+          }
+          - (void)commit:(const id __unsafe_unretained *)cbs count:(NSUInteger)n { [self commit:cbs count:n options:nil]; }
+          - (void)signalEvent:(id<MTLEvent>)e value:(uint64_t)v { id<MTLCommandBuffer> cb = [g_shim_q commandBuffer]; [cb encodeSignalEvent:e value:v]; [cb commit]; }
+          - (void)waitForEvent:(id<MTLEvent>)e value:(uint64_t)v { id<MTLCommandBuffer> cb = [g_shim_q commandBuffer]; [cb encodeWaitForEvent:e value:v]; [cb commit]; }
+          - (void)waitForDrawable:(id)d { (void)d; }
+          - (void)signalDrawable:(id)d { (void)d; }
+          - (void)addResidencySet:(id)s { (void)s; }
+          - (void)addResidencySets:(const id __unsafe_unretained *)s count:(NSUInteger)n { (void)s; (void)n; }
+          - (void)removeResidencySet:(id)s { (void)s; }
+          - (void)setLabel:(NSString *)l { (void)l; }
+          @end
+
+          @interface NxDevice : NSObject { id<MTLDevice> real; } + (instancetype)wrap:(id<MTLDevice>)d; @end
+          @implementation NxDevice
+          + (instancetype)wrap:(id<MTLDevice>)d { NxDevice *n = [NxDevice new]; n->real = d; return n; }
+          - (id)forwardingTargetForSelector:(SEL)s { (void)s; return real; }
+          - (BOOL)respondsToSelector:(SEL)s {
+              if (s == @selector(newCompilerWithDescriptor:error:) || s == @selector(newArchiveWithURL:error:) || s == @selector(newCounterHeapWithDescriptor:error:)) return NO;
+              return [NxDevice instancesRespondToSelector:s] || [real respondsToSelector:s];
+          }
+          - (BOOL)supportsFamily:(MTLGPUFamily)f { return f == MTLGPUFamilyMetal4 ? NO : [real supportsFamily:f]; }
+          - (id)newMTL4CommandQueueWithDescriptor:(MTL4CommandQueueDescriptor *)d error:(NSError **)e { (void)e; NxQueue *q = [NxQueue new]; q->fq = d.feedbackQueue; return q; }
+          - (id)newCommandAllocatorWithDescriptor:(id)d error:(NSError **)e { (void)d; (void)e; return [NxAllocator new]; }
+          - (id)newCommandAllocator { return [NxAllocator new]; }
+          - (id)newCommandBuffer { return [NxCB new]; }
+          - (id)newArgumentTableWithDescriptor:(id)d error:(NSError **)e { (void)d; (void)e; return [NxTable new]; }
+          - (id)newResidencySetWithDescriptor:(id)d error:(NSError **)e { (void)d; (void)e; return [NxResidencySet new]; }
+          - (id)newCounterHeapWithDescriptor:(id)d error:(NSError **)e { (void)d; if (e) *e = nil; return nil; }
+          - (id)newPipelineDataSetSerializerWithDescriptor:(id)d { (void)d; return nil; }
+          - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d { id<MTLTexture> t = [real newTextureWithDescriptor:d]; if (t) shim_rid_hook(t); return t; }
+          - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d { id<MTLSamplerState> s = [real newSamplerStateWithDescriptor:d]; if (s) shim_rid_hook(s); return s; }
+          @end
+
+          static void nx_install(void) {
+              g_shim = 1;
+              g_shim_q = [g_dev newCommandQueueWithMaxCommandBufferCount:512];
+              id<MTLDevice> real = g_dev;
+              g_dev = (id)[NxDevice wrap:real];
+              g_res = (id)[NxResidencySet new];
+              Class oc = object_getClass([MTL4CommitOptions new]); SEL s = @selector(addFeedbackHandler:);
+              Method m = class_getInstanceMethod(oc, s);
+              if (m) {
+                  void (*orig)(id, SEL, id) = (void (*)(id, SEL, id))method_getImplementation(m);
+                  class_replaceMethod(oc, s, imp_implementationWithBlock(^(id me, id h) {
+                      NSMutableArray *a = objc_getAssociatedObject(me, &kShimFb); if (!a) { a = [NSMutableArray array]; objc_setAssociatedObject(me, &kShimFb, a, OBJC_ASSOCIATION_RETAIN_NONATOMIC); }
+                      [a addObject:[h copy]]; orig(me, s, h);
+                  }), method_getTypeEncoding(m));
+              } else MLOG("[RED] shim: cannot hook MTL4CommitOptions");
+              MLOG("[RED] Metal device %s has no Metal 4: running the NVN layer on classic-Metal stand-ins (slower; experimental)", real.name.UTF8String);
+          }
+          #endif'''
+          patch("dm/gfx/nvn/nvn_mtl.m", [
+          ("void mtl_init(void) {\n    if (g_dev) return;\n", SHIM + "\nvoid mtl_init(void) {\n    if (g_dev) return;\n"),
+          ("    if (!no4) {\n        dispatch_queue_attr_t feedback_attr",
+           "#if TARGET_OS_IOS && !TARGET_OS_SIMULATOR\n    if (no4 && !g_classic_ok && !getenv(\"DM_NO_SHIM\")) { nx_install(); no4 = NULL; }\n#endif\n    if (!no4) {\n        dispatch_queue_attr_t feedback_attr"),
+          ("    [g_q addResidencySet:g_res];\n    [g_q4 addResidencySet:g_res];", "    if (!g_shim) [g_q addResidencySet:g_res];\n    [g_q4 addResidencySet:g_res];"),
+          ("    if (v && !(g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev])) {", "    if (v && (g_shim || !(g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev]))) {"),
           ])
           PY
           git diff --stat
