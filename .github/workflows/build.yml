@@ -253,9 +253,9 @@ jobs:
               NSArray *a = g_shim_snap, *h = g_shim_heaps.count ? [g_shim_heaps allObjects] : nil;
               pthread_mutex_unlock(&g_shim_mu);
               NSUInteger n = a.count;
-              if (n) { id __unsafe_unretained *p = malloc(n * sizeof *p); [a getObjects:p range:NSMakeRange(0, n)]; [enc useResources:(const id<MTLResource> __unsafe_unretained *)p count:n usage:MTLResourceUsageRead | MTLResourceUsageWrite]; free(p); }
+              if (n) { id __unsafe_unretained *p = (id __unsafe_unretained *)malloc(n * sizeof *p); [a getObjects:p range:NSMakeRange(0, n)]; [enc useResources:(const id<MTLResource> __unsafe_unretained *)p count:n usage:MTLResourceUsageRead | MTLResourceUsageWrite]; free(p); }
               NSUInteger hn = h.count;
-              if (hn) { id __unsafe_unretained *p = malloc(hn * sizeof *p); [h getObjects:p range:NSMakeRange(0, hn)]; [enc useHeaps:(const id<MTLHeap> __unsafe_unretained *)p count:hn]; free(p); }
+              if (hn) { id __unsafe_unretained *p = (id __unsafe_unretained *)malloc(hn * sizeof *p); [h getObjects:p range:NSMakeRange(0, hn)]; [enc useHeaps:(const id<MTLHeap> __unsafe_unretained *)p count:hn]; free(p); }
           }
 
           @interface NxBase : NSObject @end
@@ -297,15 +297,17 @@ jobs:
           typedef struct { uint64_t a[32], t[8], s[8]; } nx_bound;   // what an encoder has bound from one table (the table's generation per slot)
           static inline void nx_flush_table(NxTable *t, nx_bound *b, int stage, id enc) {   // stage: 0 vertex, 1 fragment, 2 compute
               if (!t) return;
+              id<MTLRenderCommandEncoder> re = stage < 2 ? enc : nil;
+              id<MTLComputeCommandEncoder> ce = stage == 2 ? enc : nil;
               for (int i = 0; i < 32; i++) if (t->addr[i] && t->ga[i] != b->a[i]) {
                   b->a[i] = t->ga[i]; NSUInteger off = 0; id<MTLBuffer> buf = shim_buf(t->addr[i], &off); if (!buf) continue;
-                  if (stage == 0) [enc setVertexBuffer:buf offset:off atIndex:i]; else if (stage == 1) [enc setFragmentBuffer:buf offset:off atIndex:i]; else [enc setBuffer:buf offset:off atIndex:i];
+                  if (stage == 0) [re setVertexBuffer:buf offset:off atIndex:i]; else if (stage == 1) [re setFragmentBuffer:buf offset:off atIndex:i]; else [ce setBuffer:buf offset:off atIndex:i];
               }
               for (int i = 0; i < 8; i++) {
-                  if (t->tex[i] && t->gt[i] != b->t[i]) { b->t[i] = t->gt[i]; id o = shim_rid_get(t->tex[i]);
-                      if (o) { if (stage == 0) [enc setVertexTexture:o atIndex:i]; else if (stage == 1) [enc setFragmentTexture:o atIndex:i]; else [enc setTexture:o atIndex:i]; } }
-                  if (t->smp[i] && t->gs[i] != b->s[i]) { b->s[i] = t->gs[i]; id o = shim_rid_get(t->smp[i]);
-                      if (o) { if (stage == 0) [enc setVertexSamplerState:o atIndex:i]; else if (stage == 1) [enc setFragmentSamplerState:o atIndex:i]; else [enc setSamplerState:o atIndex:i]; } }
+                  if (t->tex[i] && t->gt[i] != b->t[i]) { b->t[i] = t->gt[i]; id<MTLTexture> o = shim_rid_get(t->tex[i]);
+                      if (o) { if (stage == 0) [re setVertexTexture:o atIndex:i]; else if (stage == 1) [re setFragmentTexture:o atIndex:i]; else [ce setTexture:o atIndex:i]; } }
+                  if (t->smp[i] && t->gs[i] != b->s[i]) { b->s[i] = t->gs[i]; id<MTLSamplerState> o = shim_rid_get(t->smp[i]);
+                      if (o) { if (stage == 0) [re setVertexSamplerState:o atIndex:i]; else if (stage == 1) [re setFragmentSamplerState:o atIndex:i]; else [ce setSamplerState:o atIndex:i]; } }
               }
           }
 
@@ -338,7 +340,7 @@ jobs:
           - (void)barrierAfterQueueStages:(MTLStages)a beforeStages:(MTLStages)b visibilityOptions:(NSUInteger)v { (void)a; (void)b; (void)v; }
           - (void)barrierAfterStages:(MTLStages)a beforeQueueStages:(MTLStages)b visibilityOptions:(NSUInteger)v { (void)a; (void)b; (void)v; }
           - (void)barrierAfterEncoderStages:(MTLStages)a beforeEncoderStages:(MTLStages)b visibilityOptions:(NSUInteger)v { (void)a; (void)b; (void)v;
-              if (@available(iOS 16.0, *)) [e memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures | MTLBarrierScopeRenderTargets afterStages:MTLRenderStageFragment beforeStages:MTLRenderStageVertex]; }
+              if (@available(iOS 16.0, *)) [e memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures afterStages:MTLRenderStageFragment beforeStages:MTLRenderStageVertex]; }
           - (void)writeTimestampWithGranularity:(NSInteger)g afterStage:(NSUInteger)s intoHeap:(id)h atIndex:(NSUInteger)i { (void)g; (void)s; (void)h; (void)i; }
           @end
 

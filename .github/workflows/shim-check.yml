@@ -25,5 +25,5 @@ jobs:
           open("shim_check.m", "w", encoding="utf-8").write(harness + body + "\nint main(void) { return 0; }\n")
           print("wrote shim_check.m,", len(body.splitlines()), "lines of shim")
           PY
-          xcrun --sdk iphoneos clang -fsyntax-only -fobjc-arc -arch arm64 -miphoneos-version-min=17.0 -Wall -Wextra -Wno-unused-parameter shim_check.m 2>&1 | tee check.log
+          xcrun --sdk iphoneos clang -fsyntax-only -fobjc-arc -arch arm64 -miphoneos-version-min=26.0 -Wall -Wextra -Wno-unused-parameter shim_check.m 2>&1 | tee check.log
           ! grep -q "error:" check.log
