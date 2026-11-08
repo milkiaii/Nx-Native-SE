@@ -471,6 +471,11 @@ jobs:
           ("    [g_q addResidencySet:g_res];\n    [g_q4 addResidencySet:g_res];", "    if (!g_shim) [g_q addResidencySet:g_res];\n    [g_q4 addResidencySet:g_res];"),
           ("    if (v && !(g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev])) {", "    if (v && (g_shim || !(g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev]))) {"),
           ])
+          # ---- 4. hle_svc.c: a game that asks for more heap than this phone's address space can hold (Captain Toad: 3 GB) gets the heap it can have, as success; it uses far less. Experimental ----
+          patch("dm/host/hle_svc.c", [
+          (r'''        if (size > g_heap_cap) { LOG("SetHeapSize OOM:''', r'''        if (size > g_heap_cap && g_heap_cap < 0x40000000 && g_heap_cap >= 0x10000000 && size >= 0x80000000) { LOG("SetHeapSize clamp: req %#zx -> cap %#zx", size, g_heap_cap); size = g_heap_cap; }
+                  if (size > g_heap_cap) { LOG("SetHeapSize OOM:'''),
+          ])
           PY
           git diff --stat
 
